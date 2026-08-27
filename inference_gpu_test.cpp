@@ -43,7 +43,7 @@ namespace fs = std::filesystem;
 // Configuration / geometry
 // ---------------------------------------------------------------------------
 static std::string g_modelPath, g_imagesDir;
-static int   g_W = 256, g_H = 256;
+static int   g_W = 256, g_H = 256, g_inferenceThreads = 1;
 static int   g_bpp = 24, g_channels = 3, g_B = (int)kBatchSize;
 static size_t g_imgBytes = 0;
 static std::vector<cv::Mat> g_images;
@@ -299,6 +299,7 @@ static bool Configure()
     cp.sizeX = (DWORD)g_W;
     cp.sizeY = (DWORD)g_H;
     cp.bpp = (DWORD)g_bpp;
+	cp.inferenceThreads = (DWORD)g_inferenceThreads;
     cp.batchSize = kBatchSize;
     cp.ringSlots = (DWORD)g_inFlight;   // the controller imposes the ring depth
     cp.inferenceType = InferenceType::ANOMALY;

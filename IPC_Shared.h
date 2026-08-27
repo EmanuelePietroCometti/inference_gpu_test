@@ -102,6 +102,7 @@ typedef struct controlPoint {
     DWORD sizeX;            // width  of ONE input image (model image size)
     DWORD sizeY;            // height of ONE input image
     DWORD bpp;             // bits per pixel of ONE input image (e.g. 24)
+	DWORD inferenceThreads;   // number of threads the inference program should run
     TCHAR pathModello[512];// ONNX model path; contract lives in its metadata
     TCHAR mutexName[128];
     TCHAR resultsEventName[128];
