@@ -113,6 +113,7 @@ typedef struct controlPoint {
 
     // ---- batch extension (appended) ----
     DWORD batchSize;       // = kBatchSize for the inference_gpu provider
+    DWORD loopBatch1;      // 0 = no, 1 = loop the first batch (for testing)
     DWORD ringSlots;       // ring depth / max in-flight, chosen by the CONTROLLER
                            // (1..kMaxRingSlots). The worker reads it, never sets it.
 } controlPoint, * PTcontrolPoint;

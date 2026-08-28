@@ -45,6 +45,7 @@ namespace fs = std::filesystem;
 static std::string g_modelPath, g_imagesDir;
 static int   g_W = 256, g_H = 256, g_inferenceThreads = 1;
 static int   g_bpp = 24, g_channels = 3, g_B = (int)kBatchSize;
+static int  g_loop1 = 0;
 static size_t g_imgBytes = 0;
 static std::vector<cv::Mat> g_images;
 
@@ -300,7 +301,8 @@ static bool Configure()
     cp.sizeY = (DWORD)g_H;
     cp.bpp = (DWORD)g_bpp;
 	cp.inferenceThreads = (DWORD)g_inferenceThreads;
-    cp.batchSize = kBatchSize;
+    cp.batchSize = (DWORD)g_B;
+	cp.loopBatch1 = (DWORD)g_loop1;
     cp.ringSlots = (DWORD)g_inFlight;   // the controller imposes the ring depth
     cp.inferenceType = InferenceType::ANOMALY;
     cp.status = PointState::IDLE;
@@ -477,7 +479,7 @@ static void QuitAll()
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
-        fmt::print(stderr, "Usage: {} <onnx_model_path> <images_dir> [W=256] [H=256] [frameIntervalMs=40] [warmupBatches=100] [inFlight=5, max {}]\n", argv[0], (int)kMaxRingSlots);
+        fmt::print(stderr, "Usage: {} <onnx_model_path> <images_dir> [W=256] [H=256] [frameIntervalMs=40] [warmupBatches=100] [inFlight=5, max {}] [inferenceThreads=1] [batchSize=17] [loop1=0]\n", argv[0], (int)kMaxRingSlots);
         return -1;
     }
     g_modelPath = argv[1];
@@ -492,6 +494,9 @@ int main(int argc, char* argv[])
         if (v > (int)kMaxRingSlots) v = (int)kMaxRingSlots; // clamp to the ABI ceiling
         g_inFlight = v;
     }
+    if (argc > 8) { int v = std::atoi(argv[8]); g_inferenceThreads = (v >= 1) ? v : 1; } 
+    if (argc > 9) { int v = std::atoi(argv[9]); g_B = (v >= 1) ? v : 1; }
+    if (argc > 10) g_loop1 = (std::atoi(argv[10]) != 0) ? 1 : 0;
     g_permits = std::make_unique<std::counting_semaphore<kMaxRingSlots>>(g_inFlight);
     g_channels = g_bpp / 8;
     g_imgBytes = (size_t)g_W * g_H * g_channels;
