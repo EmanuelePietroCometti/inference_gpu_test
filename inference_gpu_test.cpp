@@ -224,7 +224,7 @@ static void ReceiverLoop()
                 std::chrono::high_resolution_clock::now() - g_pubTime[s]).count();
             g_permits->release();   // free the slot -> the sender can publish the next batch
 
-            // ---- warmup gate: skip the first g_warmupBatches from the stats ----
+            // warmup gate: skip the first g_warmupBatches from the stats
             if (g_warming.load()) {
                 if (r >= g_warmupBatches) {
                     g_baseReceived = r;
@@ -241,7 +241,7 @@ static void ReceiverLoop()
                 continue; // do not accumulate stats during warmup
             }
 
-            // ---- measured window ----
+            // measured window
             if (g_latCount == 0 || lat < g_latMinMs) g_latMinMs = lat;
             if (lat > g_latMaxMs) g_latMaxMs = lat;
             g_latSumMs += lat; ++g_latCount;
@@ -285,9 +285,6 @@ static void ReceiverLoop()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Commands
-// ---------------------------------------------------------------------------
 static bool Configure()
 {
     if (g_configured.load()) { fmt::print("[TEST] already configured.\n"); return true; }
@@ -475,7 +472,6 @@ static void QuitAll()
     WaitForSingleObject(hAck, 30000);
 }
 
-// ---------------------------------------------------------------------------
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
@@ -518,7 +514,7 @@ int main(int argc, char* argv[])
     if (g_images.empty()) { fmt::print(stderr, "[TEST] no images found in {}\n", g_imagesDir); return -1; }
     fmt::print("[TEST] Loaded {} images from {} ({}x{}).\n", g_images.size(), g_imagesDir, g_W, g_H);
 
-    // ---- global IPC objects (create-or-open, so start order is free) ----
+    // global IPC objects (create-or-open, so start order is free)
     hList = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(controlPointsList), L"CONTROLPOINTLIST");
     if (!hList) { fmt::print(stderr, "CreateFileMapping list failed ({})\n", GetLastError()); return -1; }
     pList = (PTcontrolPointsList)MapViewOfFile(hList, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(controlPointsList));
@@ -559,7 +555,7 @@ int main(int argc, char* argv[])
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
 
-    // ---- cleanup ----
+    // Cleanup
     if (pIn) UnmapViewOfFile(pIn);
     if (pResImg) UnmapViewOfFile(pResImg);
     if (pRes) UnmapViewOfFile(pRes);
