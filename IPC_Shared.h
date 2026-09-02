@@ -141,10 +141,14 @@ typedef struct controlPointsList {
 //
 //   [ batchInputHeader | slot0 (kBatchSize imgs) | slot1 | ... ]
 //
-typedef struct batchInputHeader {
+
+/// Page size for DMA alignment, Slotsw must start on a page boundary.
+constexpr SIZE_T kPageSize = 4096; // round up to a page for alignment
+typedef struct alignas(kPageSize) batchInputHeader {
     volatile LONG publishSeq;            // last published sequence (monotonic)
     DWORD         frameId[kMaxRingSlots];// frameId stored per ring slot (ceiling-sized)
     DWORD         _reserved;
+    BYTE          _pad[kPageSize - (sizeof(LONG) + sizeof(DWORD) * (kMaxRingSlots + 1))];
 } batchInputHeader;
 
 // One per-image result inside a batch
