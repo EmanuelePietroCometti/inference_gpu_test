@@ -84,12 +84,11 @@ static std::atomic<long> g_sent{ 0 }, g_received{ 0 }, g_ok{ 0 }, g_reject{ 0 };
 static std::atomic<long> g_drops{ 0 };          // ticks that couldn't push (pipeline busy)
 static int g_frameIntervalMs = 40;              // fixed frame-grabber interval
 
-// Warmup: the first g_warmupBatches results are NOT counted (GPU ramps to its
-// steady clock and the pipeline fills). When that many results have arrived, the
-// receiver captures baselines and restarts the measurement window from zero.
-static int  g_warmupBatches = 100;
-static std::atomic<bool> g_warming{ false };
-static long g_baseReceived = 0, g_baseSent = 0, g_baseOk = 0, g_baseReject = 0, g_baseDrops = 0;
+// Warmup gate REMOVED: every result is counted from the very first batch, so the
+// reported figures include the pipeline fill and the GPU clock ramp. Nothing is
+// discarded. The baselines below are kept at 0 so the "measured window" formulas
+// downstream stay untouched (x - 0 == x); argv[6] is still accepted for command
+// line compatibility but no longer skips anything.
 static size_t g_imgCursor = 0;
 static int g_lastSeq[kMaxRingSlots];
 static std::thread g_senderThread, g_receiverThread;
@@ -220,29 +219,12 @@ static void ReceiverLoop()
                 std::chrono::high_resolution_clock::now() - g_pubTime[s]).count();
             g_permits->release();   // free the slot -> the sender can publish the next batch
 
-            // warmup gate: skip the first g_warmupBatches from the stats
-            if (g_warming.load()) {
-                if (r >= g_warmupBatches) {
-                    g_baseReceived = r;
-                    g_baseSent = g_sent.load();
-                    g_baseOk = g_ok.load();
-                    g_baseReject = g_reject.load();
-                    g_baseDrops = g_drops.load();
-                    g_latSumMs = 0.0; g_latMinMs = 0.0; g_latMaxMs = 0.0; g_latCount = 0;
-                    g_tStart = std::chrono::high_resolution_clock::now();
-                    g_warming.store(false);
-                    fmt::print("[TEST] Warmup complete ({} batches skipped). Measuring...\n", g_warmupBatches);
-                    fflush(stdout);
-                }
-                continue; // do not accumulate stats during warmup
-            }
-
-            // measured window
+            // No warmup gate: batch #1 onwards is measured.
             if (g_latCount == 0 || lat < g_latMinMs) g_latMinMs = lat;
             if (lat > g_latMaxMs) g_latMaxMs = lat;
             g_latSumMs += lat; ++g_latCount;
 
-            const long mr = r - g_baseReceived; // measured batch index
+            const long mr = r;                  // measured batch index (no warmup offset)
 
             if (!g_savedFrame0.exchange(true)) {
                 cv::Mat mosaic(g_H * g_B, g_W, CV_8UC3);
@@ -255,13 +237,13 @@ static void ReceiverLoop()
                 fmt::print("[TEST] Saved test_overlays_frame0.png\n"); fflush(stdout);
             }
 
-            if (mr % 500 == 0) {
+            if (mr <= 10 || mr % 500 == 0) {   // early batches now visible (no warmup gate)
                 double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::high_resolution_clock::now() - g_tStart).count();
                 const double imgPerS = 1000.0 * mr * g_B / ms;   // frame rate
                 const double msPerImg = ms / (mr * g_B);         // throughput time/image
                 const double avgLatBatch = g_latSumMs / g_latCount;
-                const long mdrops = g_drops.load() - g_baseDrops;
+                const long mdrops = g_drops.load();
                 fmt::print("[TEST] {} batches | {:.1f} img/s | {:.3f} ms/img | {:.2f} ms/batch "
                     "| latency {:.1f} ms/batch ({:.3f} ms/img) | drops {}\n",
                     mr, imgPerS, msPerImg, msPerImg * g_B, avgLatBatch, avgLatBatch / g_B, mdrops);
@@ -387,8 +369,6 @@ static void StartInference()
     g_sent.store(0); g_received.store(0); g_ok.store(0); g_reject.store(0); g_drops.store(0);
     g_imgCursor = 0;
     g_latSumMs = 0.0; g_latMinMs = 0.0; g_latMaxMs = 0.0; g_latCount = 0;
-    g_baseReceived = 0; g_baseSent = 0; g_baseOk = 0; g_baseReject = 0; g_baseDrops = 0;
-    g_warming.store(g_warmupBatches > 0);
 
     // Skip any stale RESULT_READY slots left in the ring by a previous run, so
     // they are not re-counted (fresh batches will carry higher seq values).
@@ -422,13 +402,12 @@ static void StopInference()
 
     double ms = std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - g_tStart).count();
-    // All figures are for the MEASURED window (after warmup): subtract baselines.
-    const bool warmupDone = !g_warming.load();
-    long total = g_received.load() - g_baseReceived;
-    long drops = g_drops.load() - g_baseDrops;
-    long msent = g_sent.load() - g_baseSent;
-    long okCnt = g_ok.load() - g_baseOk;
-    long rejCnt = g_reject.load() - g_baseReject;
+    // Every batch counts: no warmup window is subtracted.
+    long total = g_received.load();
+    long drops = g_drops.load();
+    long msent = g_sent.load();
+    long okCnt = g_ok.load();
+    long rejCnt = g_reject.load();
     double patches = (double)total * g_B;
 
     const double batchesPerS = (ms > 0) ? 1000.0 * total / ms : 0.0;
@@ -440,10 +419,7 @@ static void StopInference()
     fmt::print("\n=================================================\n");
     fmt::print("                  RUN SUMMARY\n");
     fmt::print("=================================================\n");
-    if (!warmupDone)
-        fmt::print("(!) stopped during warmup: figures include warmup batches\n");
-    else
-        fmt::print("Warmup skipped     : {} batches\n", g_warmupBatches);
+    fmt::print("Warmup skipped     : 0 batches (measured from the first batch)\n");
     const long ticks = msent + drops;
     if (g_frameIntervalMs <= 0) {
         fmt::print("Mode               : FREE-RUNNING (max throughput)\n");
@@ -495,7 +471,7 @@ static void QuitAll()
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
-        fmt::print(stderr, "Usage: {} <onnx_model_path> <images_dir> [W=256] [H=256] [frameIntervalMs=40] [warmupBatches=100] [inFlight=5, max {}] [inferenceThreads=1] [batchSize=17] [loop1=0]\n", argv[0], (int)kMaxRingSlots);
+        fmt::print(stderr, "Usage: {} <onnx_model_path> <images_dir> [W=256] [H=256] [frameIntervalMs=40] [warmupBatches=IGNORED] [inFlight=5, max {}] [inferenceThreads=1] [batchSize=17] [loop1=0]\n", argv[0], (int)kMaxRingSlots);
         return -1;
     }
     g_modelPath = argv[1];
@@ -503,7 +479,11 @@ int main(int argc, char* argv[])
     g_W = (argc > 3) ? std::atoi(argv[3]) : 256;
     g_H = (argc > 4) ? std::atoi(argv[4]) : 256;
     if (argc > 5) g_frameIntervalMs = std::atoi(argv[5]);           // 0 = free-running
-    if (argc > 6) { int v = std::atoi(argv[6]); if (v >= 0) g_warmupBatches = v; }
+    if (argc > 6 && std::atoi(argv[6]) != 0) {
+        // Positional slot kept so existing command lines still parse; the warmup
+        // gate itself is gone, so the value is deliberately ignored.
+        fmt::print("[TEST] NOTE: warmupBatches={} ignored, the warmup gate has been removed.\n", argv[6]);
+    }
     if (argc > 7) {
         int v = std::atoi(argv[7]);
         if (v < 1) v = 1;
