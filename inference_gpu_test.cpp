@@ -101,8 +101,9 @@ static std::atomic<bool> g_quitRequested{ false };
 // slot's stamp is never overwritten before its result is consumed. Written by
 // the receiver thread only; read by the main thread after join.
 static std::chrono::high_resolution_clock::time_point g_pubTime[kMaxRingSlots];
-static double g_latSumMs = 0.0, g_latMinMs = 0.0, g_latMaxMs = 0.0;
-static long   g_latCount = 0;
+static double g_lastSumMs = 0.0, g_lastMinMs = 0.0, g_lastMaxMs = 0.0;
+static long   g_lastCount = 0;
+static std::thread g_frame0Thread;
 static constexpr double kTargetMsPerImage = 2.16; // GPU speed target for skrd4ad
 
 namespace {
@@ -215,38 +216,52 @@ static void ReceiverLoop()
                 (rb->results[k].status == PatchStatus::REJECT ? rej : ok)++;
             g_ok += ok; g_reject += rej;
             long r = g_received.fetch_add(1) + 1;
-            double lat = std::chrono::duration<double, std::milli>(
-                std::chrono::high_resolution_clock::now() - g_pubTime[s]).count();
+            double lat = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - g_pubTime[s]).count();
             g_permits->release();   // free the slot -> the sender can publish the next batch
 
             // No warmup gate: batch #1 onwards is measured.
-            if (g_latCount == 0 || lat < g_latMinMs) g_latMinMs = lat;
-            if (lat > g_latMaxMs) g_latMaxMs = lat;
-            g_latSumMs += lat; ++g_latCount;
+            if (g_lastCount == 0 || lat < g_lastMinMs) g_lastMinMs = lat;
+            if (lat > g_lastMaxMs) g_lastMaxMs = lat;
+            g_lastSumMs += lat; ++g_lastCount;
 
             const long mr = r;                  // measured batch index (no warmup offset)
 
             if (!g_savedFrame0.exchange(true)) {
-                cv::Mat mosaic(g_H * g_B, g_W, CV_8UC3);
+				auto mosaic = std::make_shared<cv::Mat>(g_H * g_B, g_W, CV_8UC3);
                 const unsigned char* ovBase = pResImg + IpcResultImageSlotOffset(*cpPtr, (DWORD)s);
                 for (int k = 0; k < g_B; ++k) {
                     cv::Mat one(g_H, g_W, CV_8UC3, const_cast<unsigned char*>(ovBase) + (size_t)k * g_imgBytes);
-                    one.copyTo(mosaic(cv::Rect(0, k * g_H, g_W, g_H)));
+                    one.copyTo((*mosaic)(cv::Rect(0, k * g_H, g_W, g_H)));
                 }
-                cv::imwrite("test_overlays_frame0.png", mosaic);
+                g_frame0Thread = std::thread([mosaic]() {
+                    try {
+                        cv::imwrite("test_overlays_frame0.png", *mosaic);
+                    }
+                    catch (const std::exception& e) {
+                        fmt::print(stderr, "[TEST] imwrite failed: {}\n", e.what());
+                    }
+                });
                 fmt::print("[TEST] Saved test_overlays_frame0.png\n"); fflush(stdout);
             }
 
-            if (mr <= 10 || mr % 500 == 0) {   // early batches now visible (no warmup gate)
-                double ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::high_resolution_clock::now() - g_tStart).count();
-                const double imgPerS = 1000.0 * mr * g_B / ms;   // frame rate
-                const double msPerImg = ms / (mr * g_B);         // throughput time/image
-                const double avgLatBatch = g_latSumMs / g_latCount;
-                const long mdrops = g_drops.load();
+			static long s_lastBatch = 0;
+			static double s_lastMs = 0.0;
+            if (mr % 500 == 0) {   // early batches now visible (no warmup gate)
+                double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - g_tStart).count();
+                const double wMs = ms - s_lastMs;
+				const long wBatch = mr - s_lastBatch;
+                const double imgPerS = 1000.0 * wBatch * g_B / wMs;
+				const double msPerImg = wMs / (wBatch * g_B);
+				s_lastMs = ms; 
+                s_lastBatch = mr;
                 fmt::print("[TEST] {} batches | {:.1f} img/s | {:.3f} ms/img | {:.2f} ms/batch "
-                    "| latency {:.1f} ms/batch ({:.3f} ms/img) | drops {}\n",
-                    mr, imgPerS, msPerImg, msPerImg * g_B, avgLatBatch, avgLatBatch / g_B, mdrops);
+                    "| latency {:.1f} ms/batch | drops {}\n",
+                    mr,
+                    imgPerS,
+                    msPerImg,
+                    msPerImg * g_B,
+                    g_lastSumMs / g_lastCount,
+                    g_drops.load());
                 fflush(stdout);
             }
         }
@@ -368,7 +383,7 @@ static void StartInference()
     g_stop.store(false); g_senderDone.store(false); g_savedFrame0.store(false);
     g_sent.store(0); g_received.store(0); g_ok.store(0); g_reject.store(0); g_drops.store(0);
     g_imgCursor = 0;
-    g_latSumMs = 0.0; g_latMinMs = 0.0; g_latMaxMs = 0.0; g_latCount = 0;
+    g_lastSumMs = 0.0; g_lastMinMs = 0.0; g_lastMaxMs = 0.0; g_lastCount = 0;
 
     // Skip any stale RESULT_READY slots left in the ring by a previous run, so
     // they are not re-counted (fresh batches will carry higher seq values).
@@ -414,12 +429,11 @@ static void StopInference()
     const double imgPerS = (ms > 0) ? 1000.0 * patches / ms : 0.0;   // frame rate
     const double msPerImg = (patches > 0) ? ms / patches : 0.0;      // throughput time/image
     const double msPerBatch = (total > 0) ? ms / total : 0.0;
-    const double avgLatBatch = (g_latCount > 0) ? g_latSumMs / g_latCount : 0.0;
+    const double avgLatBatch = (g_lastCount > 0) ? g_lastSumMs / g_lastCount : 0.0;
 
     fmt::print("\n=================================================\n");
     fmt::print("                  RUN SUMMARY\n");
     fmt::print("=================================================\n");
-    fmt::print("Warmup skipped     : 0 batches (measured from the first batch)\n");
     const long ticks = msent + drops;
     if (g_frameIntervalMs <= 0) {
         fmt::print("Mode               : FREE-RUNNING (max throughput)\n");
@@ -447,7 +461,7 @@ static void StopInference()
     fmt::print("-------------------------------------------------\n");
     fmt::print("END-TO-END LATENCY (copy -> result, receiver side)\n");
     fmt::print("  per batch        : avg {:.2f} ms | min {:.2f} | max {:.2f}\n",
-        avgLatBatch, g_latMinMs, g_latMaxMs);
+        avgLatBatch, g_lastMinMs, g_lastMaxMs);
     fmt::print("  per image        : avg {:.3f} ms\n", avgLatBatch / g_B);
     fmt::print("=================================================\n");
     fflush(stdout);
@@ -471,7 +485,7 @@ static void QuitAll()
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
-        fmt::print(stderr, "Usage: {} <onnx_model_path> <images_dir> [W=256] [H=256] [frameIntervalMs=40] [warmupBatches=IGNORED] [inFlight=5, max {}] [inferenceThreads=1] [batchSize=17] [loop1=0]\n", argv[0], (int)kMaxRingSlots);
+        fmt::print(stderr, "Usage: {} <onnx_model_path> <images_dir> [W=256] [H=256] [frameIntervalMs=40] [inFlight=5, max {}] [inferenceThreads=1] [batchSize=17] [loop1=0]\n", argv[0], (int)kMaxRingSlots);
         return -1;
     }
     g_modelPath = argv[1];
@@ -479,20 +493,15 @@ int main(int argc, char* argv[])
     g_W = (argc > 3) ? std::atoi(argv[3]) : 256;
     g_H = (argc > 4) ? std::atoi(argv[4]) : 256;
     if (argc > 5) g_frameIntervalMs = std::atoi(argv[5]);           // 0 = free-running
-    if (argc > 6 && std::atoi(argv[6]) != 0) {
-        // Positional slot kept so existing command lines still parse; the warmup
-        // gate itself is gone, so the value is deliberately ignored.
-        fmt::print("[TEST] NOTE: warmupBatches={} ignored, the warmup gate has been removed.\n", argv[6]);
-    }
-    if (argc > 7) {
+    if (argc > 6) {
         int v = std::atoi(argv[7]);
         if (v < 1) v = 1;
         if (v > (int)kMaxRingSlots) v = (int)kMaxRingSlots; // clamp to the ABI ceiling
         g_inFlight = v;
     }
-    if (argc > 8) { int v = std::atoi(argv[8]); g_inferenceThreads = (v >= 1) ? v : 1; } 
-    if (argc > 9) { int v = std::atoi(argv[9]); g_B = (v >= 1) ? v : 1; }
-    if (argc > 10) g_loop1 = (std::atoi(argv[10]) != 0) ? 1 : 0;
+    if (argc > 7) { int v = std::atoi(argv[7]); g_inferenceThreads = (v >= 1) ? v : 1; } 
+    if (argc > 8) { int v = std::atoi(argv[8]); g_B = (v >= 1) ? v : 1; }
+    if (argc > 9) g_loop1 = (std::atoi(argv[9]) != 0) ? 1 : 0;
     g_permits = std::make_unique<std::counting_semaphore<kMaxRingSlots>>(g_inFlight);
     g_channels = g_bpp / 8;
     g_imgBytes = (size_t)g_W * g_H * g_channels;
@@ -560,6 +569,7 @@ int main(int argc, char* argv[])
     if (pResImg) UnmapViewOfFile(pResImg);
     if (pRes) UnmapViewOfFile(pRes);
     if (pList) UnmapViewOfFile(pList);
+    if (g_frame0Thread.joinable()) g_frame0Thread.join();
     for (HANDLE h : { hIn, hResImg, hRes, hList, hCpMutex, hCpReady, hCpResults, hListMutex, hTrigger, hAck })
         if (h) CloseHandle(h);
     fmt::print("[TEST] Done.\n");
