@@ -494,7 +494,7 @@ int main(int argc, char* argv[])
     g_H = (argc > 4) ? std::atoi(argv[4]) : 256;
     if (argc > 5) g_frameIntervalMs = std::atoi(argv[5]);           // 0 = free-running
     if (argc > 6) {
-        int v = std::atoi(argv[7]);
+        int v = std::atoi(argv[6]);
         if (v < 1) v = 1;
         if (v > (int)kMaxRingSlots) v = (int)kMaxRingSlots; // clamp to the ABI ceiling
         g_inFlight = v;
